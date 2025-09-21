@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 from torch.nn import init
 
 from layers import GaussianSample, GaussianMerge, GumbelSoftmax
@@ -10,12 +9,11 @@ from inference import log_gaussian, log_standard_gaussian
 
 class Perceptron(nn.Module):
     def __init__(self, dims, activation_fn=F.relu, output_activation=None):
-        super(Perceptron, self).__init__()
+        super().__init__()
         self.dims = dims
         self.activation_fn = activation_fn
         self.output_activation = output_activation
-
-        self.layers = nn.ModuleList(list(map(lambda d: nn.Linear(*d), list(zip(dims, dims[1:])))))
+        self.layers = nn.ModuleList([nn.Linear(a, b) for a, b in zip(dims, dims[1:])])
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
@@ -24,68 +22,51 @@ class Perceptron(nn.Module):
                 x = self.output_activation(x)
             else:
                 x = self.activation_fn(x)
-
         return x
 
 
 class Encoder(nn.Module):
     def __init__(self, dims, sample_layer=GaussianSample):
         """
-        Inference network
-
-        Attempts to infer the probability distribution
-        p(z|x) from the data by fitting a variational
-        distribution q_φ(z|x). Returns the two parameters
-        of the distribution (µ, log σ²).
-
-        :param dims: dimensions of the networks
-           given by the number of neurons on the form
-           [input_dim, [hidden_dims], latent_dim].
+        dims: [input_dim, [hidden_dims], latent_dim]
         """
-        super(Encoder, self).__init__()
-
-        [x_dim, h_dim, z_dim] = dims
+        super().__init__()
+        x_dim, h_dim, z_dim = dims
         neurons = [x_dim, *h_dim]
-        linear_layers = [nn.Linear(neurons[i - 1], neurons[i]) for i in range(1, len(neurons))]
-        batch_norm_layers = [nn.BatchNorm1d(neurons[i]) for i in range(1, len(neurons))]
-
-        self.hidden = nn.ModuleList(linear_layers)
-        self.batch_norm = nn.ModuleList(batch_norm_layers)
+        self.hidden = nn.ModuleList([nn.Linear(neurons[i - 1], neurons[i]) for i in range(1, len(neurons))])
+        self.batch_norm = nn.ModuleList([nn.BatchNorm1d(neurons[i]) for i in range(1, len(neurons))])
         self.sample = sample_layer(h_dim[-1], z_dim)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_normal_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
 
     def forward(self, x):
         for index, layer in enumerate(self.hidden):
             x = F.relu(self.batch_norm[index](layer(x)))
-        return self.sample(x)
+        return self.sample(x)  # returns (z, mu, log_var)
 
 
 class Decoder(nn.Module):
     def __init__(self, dims):
         """
-        Generative network
-
-        Generates samples from the original distribution
-        p(x) by transforming a latent representation, e.g.
-        by finding p_θ(x|z).
-
-        :param dims: dimensions of the networks
-            given by the number of neurons on the form
-            [latent_dim, [hidden_dims], input_dim].
+        dims: [latent_dim, [hidden_dims], input_dim]
         """
-        super(Decoder, self).__init__()
-
-        [z_dim, h_dim, x_dim] = dims
-
+        super().__init__()
+        z_dim, h_dim, x_dim = dims
         neurons = [z_dim, *h_dim]
-        linear_layers = [nn.Linear(neurons[i - 1], neurons[i]) for i in range(1, len(neurons))]
-        batch_norm_layers = [nn.BatchNorm1d(neurons[i]) for i in range(1, len(neurons))]
-
-        self.hidden = nn.ModuleList(linear_layers)
-        self.batch_norm = nn.ModuleList(batch_norm_layers)
-
+        self.hidden = nn.ModuleList([nn.Linear(neurons[i - 1], neurons[i]) for i in range(1, len(neurons))])
+        self.batch_norm = nn.ModuleList([nn.BatchNorm1d(neurons[i]) for i in range(1, len(neurons))])
         self.reconstruction = nn.Linear(h_dim[-1], x_dim)
-
         self.output_activation = nn.Sigmoid()
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_normal_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
 
     def forward(self, x):
         for index, layer in enumerate(self.hidden):
@@ -96,42 +77,18 @@ class Decoder(nn.Module):
 class VariationalAutoencoder(nn.Module):
     def __init__(self, dims):
         """
-        Variational Autoencoder [Kingma 2013] model
-        consisting of an encoder/decoder pair for which
-        a variational distribution is fitted to the
-        encoder. Also known as the M1 model in [Kingma 2014].
-
-        :param dims: x, z and hidden dimensions of the networks
+        dims: [x_dim, z_dim, [hidden_dims]]
         """
-        super(VariationalAutoencoder, self).__init__()
-
-        [x_dim, z_dim, h_dim] = dims
+        super().__init__()
+        x_dim, z_dim, h_dim = dims
         self.z_dim = z_dim
         self.flow = None
 
         self.encoder = Encoder([x_dim, h_dim, z_dim])
         self.decoder = Decoder([z_dim, list(reversed(h_dim)), x_dim])
-        self.kl_divergence = 0
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                init.xavier_normal(m.weight.data)
-                if m.bias is not None:
-                    m.bias.data.zero_()
+        self.kl_divergence = 0.0
 
     def _kld(self, z, q_param, p_param=None):
-        """
-        Computes the KL-divergence of
-        some element z.
-
-        KL(q||p) = -∫ q(z) log [ p(z) / q(z) ]
-                 = -E[log p(z) - log q(z)]
-
-        :param z: sample from q-distribuion
-        :param q_param: (mu, log_var) of the q-distribution
-        :param p_param: (mu, log_var) of the p-distribution
-        :return: KL(q||p)
-        """
         (mu, log_var) = q_param
 
         if self.flow is not None:
@@ -144,77 +101,60 @@ class VariationalAutoencoder(nn.Module):
         if p_param is None:
             pz = log_standard_gaussian(z)
         else:
-            (mu, log_var) = p_param
-            pz = log_gaussian(z, mu, log_var)
+            (p_mu, p_log_var) = p_param
+            pz = log_gaussian(z, p_mu, p_log_var)
 
         kl = qz - pz
-
         return kl
 
     def add_flow(self, flow):
         self.flow = flow
 
     def forward(self, x, y=None):
-        """
-        Runs a data point through the model in order
-        to provide its reconstruction and q distribution
-        parameters.
-
-        :param x: input data
-        :return: reconstructed input
-        """
         z, z_mu, z_log_var = self.encoder(x)
-
         self.kl_divergence = self._kld(z, (z_mu, z_log_var))
-
         x_mu = self.decoder(z)
-
         return x_mu
 
     def sample(self, z):
-        """
-        Given z ~ N(0, I) generates a sample from
-        the learned distribution based on p_θ(x|z).
-        :param z: (torch.autograd.Variable) Random normal variable
-        :return: (torch.autograd.Variable) generated sample
-        """
         return self.decoder(z)
 
 
 class GumbelAutoencoder(nn.Module):
     def __init__(self, dims, n_samples=100):
-        super(GumbelAutoencoder, self).__init__()
-
-        [x_dim, z_dim, h_dim] = dims
+        """
+        dims: [x_dim, z_dim(=classes), [hidden_dims]]
+        """
+        super().__init__()
+        x_dim, z_dim, h_dim = dims
         self.z_dim = z_dim
         self.n_samples = n_samples
 
         self.encoder = Perceptron([x_dim, *h_dim])
         self.sampler = GumbelSoftmax(h_dim[-1], z_dim, n_samples)
-        self.decoder = Perceptron([z_dim, *reversed(h_dim), x_dim], output_activation=F.sigmoid)
+        self.decoder = Perceptron([z_dim, *reversed(h_dim), x_dim], output_activation=torch.sigmoid)
 
-        self.kl_divergence = 0
+        self.kl_divergence = 0.0
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                init.xavier_normal(m.weight.data)
+                init.xavier_normal_(m.weight.data)
                 if m.bias is not None:
                     m.bias.data.zero_()
 
     def _kld(self, qz):
-        k = Variable(torch.FloatTensor([self.z_dim]), requires_grad=False)
-        kl = qz * (torch.log(qz + 1e-8) - torch.log(1.0 / k))
+        # qz shape expected: [B * n_samples, z_dim] (from sampler); handle general case too.
+        eps = 1e-8
+        k = torch.tensor(self.z_dim, dtype=qz.dtype, device=qz.device)
+        kl = qz * (torch.log(qz + eps) - torch.log(1.0 / k))
         kl = kl.view(-1, self.n_samples, self.z_dim)
         return torch.sum(torch.sum(kl, dim=1), dim=1)
 
-    def forward(self, x, y=None, tau=1):
+    def forward(self, x, y=None, tau=1.0):
         x = self.encoder(x)
-
         sample, qz = self.sampler(x, tau)
         self.kl_divergence = self._kld(qz)
-
         x_mu = self.decoder(sample)
-
         return x_mu
 
     def sample(self, z):
@@ -224,58 +164,54 @@ class GumbelAutoencoder(nn.Module):
 class LadderEncoder(nn.Module):
     def __init__(self, dims):
         """
-        The ladder encoder differs from the standard encoder
-        by using batch-normalization and LReLU activation.
-        Additionally, it also returns the transformation x.
-
-        :param dims: dimensions [input_dim, [hidden_dims], [latent_dims]].
+        dims: [input_dim, hidden_dim, latent_dim]
         """
-        super(LadderEncoder, self).__init__()
-        [x_dim, h_dim, self.z_dim] = dims
-        self.in_features = x_dim
-        self.out_features = h_dim
-
+        super().__init__()
+        x_dim, h_dim, z_dim = dims
         self.linear = nn.Linear(x_dim, h_dim)
         self.batchnorm = nn.BatchNorm1d(h_dim)
-        self.sample = GaussianSample(h_dim, self.z_dim)
+        self.sample = GaussianSample(h_dim, z_dim)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_normal_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
 
     def forward(self, x):
         x = self.linear(x)
         x = F.leaky_relu(self.batchnorm(x), 0.1)
-        return x, self.sample(x)
+        return x, self.sample(x)  # (z, mu, log_var)
 
 
 class LadderDecoder(nn.Module):
     def __init__(self, dims):
         """
-        The ladder dencoder differs from the standard encoder
-        by using batch-normalization and LReLU activation.
-        Additionally, it also returns the transformation x.
-
-        :param dims: dimensions of the networks
-            given by the number of neurons on the form
-            [latent_dim, [hidden_dims], input_dim].
+        dims: [latent_dim_in, hidden_dim, latent_dim_out]
         """
-        super(LadderDecoder, self).__init__()
+        super().__init__()
+        z_in, h_dim, z_out = dims
 
-        [self.z_dim, h_dim, x_dim] = dims
-
-        self.linear1 = nn.Linear(x_dim, h_dim)
+        self.linear1 = nn.Linear(z_in, h_dim)
         self.batchnorm1 = nn.BatchNorm1d(h_dim)
-        self.merge = GaussianMerge(h_dim, self.z_dim)
+        self.merge = GaussianMerge(h_dim, z_out)
 
-        self.linear2 = nn.Linear(x_dim, h_dim)
+        self.linear2 = nn.Linear(z_in, h_dim)
         self.batchnorm2 = nn.BatchNorm1d(h_dim)
-        self.sample = GaussianSample(h_dim, self.z_dim)
+        self.sample = GaussianSample(h_dim, z_out)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_normal_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
 
     def forward(self, x, l_mu=None, l_log_var=None):
         if l_mu is not None:
-            # Sample from this encoder layer and merge
             z = self.linear1(x)
             z = F.leaky_relu(self.batchnorm1(z), 0.1)
             q_z, q_mu, q_log_var = self.merge(z, l_mu, l_log_var)
 
-        # Sample from the decoder and send forward
         z = self.linear2(x)
         z = F.leaky_relu(self.batchnorm2(z), 0.1)
         z, p_mu, p_log_var = self.sample(z)
@@ -289,56 +225,57 @@ class LadderDecoder(nn.Module):
 class LadderVariationalAutoencoder(VariationalAutoencoder):
     def __init__(self, dims):
         """
-        Ladder Variational Autoencoder as described by
-        [Sønderby 2016]. Adds several stochastic
-        layers to improve the log-likelihood estimate.
-
-        :param dims: x, z and hidden dimensions of the networks
+        dims: [x_dim, [z_dims_top_to_bottom], [hidden_dims]]
         """
-        [x_dim, z_dim, h_dim] = dims
-        super(LadderVariationalAutoencoder, self).__init__([x_dim, z_dim[0], h_dim])
+        x_dim, z_dim, h_dim = dims
+        # top layer VAE (use topmost z)
+        super().__init__([x_dim, z_dim[0], h_dim])
 
         neurons = [x_dim, *h_dim]
-        encoder_layers = [LadderEncoder([neurons[i - 1], neurons[i], z_dim[i - 1]]) for i in range(1, len(neurons))]
-        decoder_layers = [LadderDecoder([z_dim[i - 1], h_dim[i - 1], z_dim[i]]) for i in range(1, len(h_dim))][::-1]
-
-        self.encoder = nn.ModuleList(encoder_layers)
-        self.decoder = nn.ModuleList(decoder_layers)
+        # encoders go bottom-up: x_dim -> h_dim[i] -> z_dim[i]
+        self.encoder = nn.ModuleList([
+            LadderEncoder([neurons[i - 1], neurons[i], z_dim[i - 1]])
+            for i in range(1, len(neurons))
+        ])
+        # decoders go top-down between latent layers; reverse for decode order
+        self.decoder = nn.ModuleList([
+            LadderDecoder([z_dim[i - 1], h_dim[i - 1], z_dim[i]])
+            for i in range(1, len(h_dim))
+        ][::-1])
+        # final reconstruction from topmost z to x
         self.reconstruction = Decoder([z_dim[0], h_dim, x_dim])
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                init.xavier_normal(m.weight.data)
+                init.xavier_normal_(m.weight.data)
                 if m.bias is not None:
                     m.bias.data.zero_()
 
     def forward(self, x):
-        # Gather latent representation
-        # from encoders along with final z.
+        # encode up the ladder
         latents = []
-        for encoder in self.encoder:
-            x, (z, mu, log_var) = encoder(x)
+        for enc in self.encoder:
+            x, (z, mu, log_var) = enc(x)
             latents.append((mu, log_var))
+        latents = list(reversed(latents))  # top to bottom
 
-        latents = list(reversed(latents))
+        # KL at the top (prior)
+        self.kl_divergence = 0.0
+        top_mu, top_log_var = latents[0]
+        self.kl_divergence += self._kld(z, (top_mu, top_log_var))
 
-        self.kl_divergence = 0
-        for i, decoder in enumerate([-1, *self.decoder]):
-            # If at top, encoder == decoder,
-            # use prior for KL.
+        # walk down the ladder, merging information
+        cur_z = z
+        for i, dec in enumerate(self.decoder, start=1):
             l_mu, l_log_var = latents[i]
-            if i == 0:
-                self.kl_divergence += self._kld(z, (l_mu, l_log_var))
+            cur_z, kl_bits = dec(cur_z, l_mu, l_log_var)  # (q_z, (q_mu, q_log_var), (p_mu, p_log_var))
+            self.kl_divergence += self._kld(*kl_bits)
 
-            # Perform downword merge of information.
-            else:
-                z, kl = decoder(z, l_mu, l_log_var)
-                self.kl_divergence += self._kld(*kl)
-
-        x_mu = self.reconstruction(z)
+        x_mu = self.reconstruction(cur_z)
         return x_mu
 
     def sample(self, z):
-        for decoder in self.decoder:
-            z = decoder(z)
-        return self.reconstruction(z)
+        cur = z
+        for dec in self.decoder:
+            cur = dec(cur)
+        return self.reconstruction(cur)

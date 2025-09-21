@@ -11,9 +11,11 @@ class Classifier(nn.Module):
     def __init__(self, dims):
         """
         Single hidden layer classifier.
+
+        dims: [x_dim, h_dim, y_dim]
         """
-        super(Classifier, self).__init__()
-        [x_dim, h_dim, y_dim] = dims
+        super().__init__()
+        x_dim, h_dim, y_dim = dims
         self.dense = nn.Linear(x_dim, h_dim)
         self.labels = nn.Linear(h_dim, y_dim)
         self.batch_norm1 = nn.BatchNorm1d(h_dim)
@@ -27,19 +29,12 @@ class Classifier(nn.Module):
 class DeepGenerativeModel(VariationalAutoencoder):
     def __init__(self, dims):
         """
-        M2 code replication from the paper
-        'Semi-Supervised Learning with Deep Generative Models'
-        (Kingma 2014) in PyTorch.
+        M2 model ('Semi-Supervised Learning with Deep Generative Models', Kingma 2014).
 
-        The "Generative semi-supervised model" is a probabilistic
-        model that incorporates label information in both
-        inference and generation.
-
-        Initialise a new generative model
-        :param dims: dimensions of x, y, z and hidden layers.
+        dims: [x_dim, y_dim, z_dim, h_dim_list]
         """
-        [x_dim, self.y_dim, z_dim, h_dim] = dims
-        super(DeepGenerativeModel, self).__init__([x_dim, z_dim, h_dim])
+        x_dim, self.y_dim, z_dim, h_dim = dims
+        super().__init__([x_dim, z_dim, h_dim])
 
         self.encoder = Encoder([x_dim + self.y_dim, h_dim, z_dim])
         self.decoder = Decoder([z_dim + self.y_dim, list(reversed(h_dim)), x_dim])
@@ -47,31 +42,25 @@ class DeepGenerativeModel(VariationalAutoencoder):
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                init.xavier_normal(m.weight.data)
+                init.xavier_normal_(m.weight.data)
                 if m.bias is not None:
                     m.bias.data.zero_()
 
     def forward(self, x, y):
-        # Add label and data and generate latent variable
+        # q(z | x, y)
         z, z_mu, z_log_var = self.encoder(torch.cat([x, y], dim=1))
-
         self.kl_divergence = self._kld(z, (z_mu, z_log_var))
 
-        # Reconstruct data point from latent data and label
+        # p(x | z, y)
         x_mu = self.decoder(torch.cat([z, y], dim=1))
-
         return x_mu
 
     def classify(self, x):
-        logits = self.classifier(x)
-        return logits
+        return self.classifier(x)
 
     def sample(self, z, y):
         """
-        Samples from the Decoder to generate an x.
-        :param z: latent normal variable
-        :param y: label (one-hot encoded)
-        :return: x
+        Sample x ~ p(x | z, y)
         """
         y = y.float()
         x = self.decoder(torch.cat([z, y], dim=1))
@@ -81,116 +70,108 @@ class DeepGenerativeModel(VariationalAutoencoder):
 class StackedDeepGenerativeModel(DeepGenerativeModel):
     def __init__(self, dims, features):
         """
-        M1+M2 model as described in [Kingma 2014].
+        M1+M2 stacked model (Kingma 2014).
 
-        Initialise a new stacked generative model
-        :param dims: dimensions of x, y, z and hidden layers
-        :param features: a pretrained M1 model of class `VariationalAutoencoder`
-            trained on the same dataset.
+        dims: [x_dim, y_dim, z_dim, h_dim_list]
+        features: pretrained VariationalAutoencoder (M1) on same data.
         """
-        [x_dim, y_dim, z_dim, h_dim] = dims
-        super(StackedDeepGenerativeModel, self).__init__([features.z_dim, y_dim, z_dim, h_dim])
+        x_dim, y_dim, z_dim, h_dim = dims
+        super().__init__([features.z_dim, y_dim, z_dim, h_dim])
 
-        # Be sure to reconstruct with the same dimensions
+        # adjust final reconstruction to original x_dim
         in_features = self.decoder.reconstruction.in_features
         self.decoder.reconstruction = nn.Linear(in_features, x_dim)
 
-        # Make vae feature model untrainable by freezing parameters
+        # freeze M1 features
         self.features = features
         self.features.train(False)
-
-        for param in self.features.parameters():
-            param.requires_grad = False
+        for p in self.features.parameters():
+            p.requires_grad = False
 
     def forward(self, x, y):
-        # Sample a new latent x from the M1 model
+        # encode via M1 to a latent representation, then use M2
         x_sample, _, _ = self.features.encoder(x)
-
-        # Use the sample as new input to M2
-        return super(StackedDeepGenerativeModel, self).forward(x_sample, y)
+        return super().forward(x_sample, y)
 
     def classify(self, x):
-        _, x, _ = self.features.encoder(x)
-        logits = self.classifier(x)
-        return logits
+        # often mu can be used; this keeps behavior consistent with your fork
+        _, x_mu, _ = self.features.encoder(x)
+        return self.classifier(x_mu)
 
 
 class AuxiliaryDeepGenerativeModel(DeepGenerativeModel):
     def __init__(self, dims):
         """
-        Auxiliary Deep Generative Models [Maaløe 2016]
-        code replication. The ADGM introduces an additional
-        latent variable 'a', which enables the model to fit
-        more complex variational distributions.
+        ADGM (Maaløe 2016): adds auxiliary latent variable a.
 
-        :param dims: dimensions of x, y, z, a and hidden layers.
+        dims: [x_dim, y_dim, z_dim, a_dim, h_dim_list]
         """
-        [x_dim, y_dim, z_dim, a_dim, h_dim] = dims
-        super(AuxiliaryDeepGenerativeModel, self).__init__([x_dim, y_dim, z_dim, h_dim])
+        x_dim, y_dim, z_dim, a_dim, h_dim = dims
+        super().__init__([x_dim, y_dim, z_dim, h_dim])
 
-        self.aux_encoder = Encoder([x_dim, h_dim, a_dim])
-        self.aux_decoder = Encoder([x_dim + z_dim + y_dim, list(reversed(h_dim)), a_dim])
+        self.aux_encoder = Encoder([x_dim, h_dim, a_dim])                           # q(a | x)
+        self.aux_decoder = Encoder([x_dim + z_dim + y_dim, list(reversed(h_dim)), a_dim])  # p(a | x, z, y)
 
-        self.classifier = Classifier([x_dim + a_dim, h_dim[0], y_dim])
+        self.classifier = Classifier([x_dim + a_dim, h_dim[0], y_dim])              # q(y | x, a)
 
-        self.encoder = Encoder([a_dim + y_dim + x_dim, h_dim, z_dim])
-        self.decoder = Decoder([y_dim + z_dim, list(reversed(h_dim)), x_dim])
+        self.encoder = Encoder([a_dim + y_dim + x_dim, h_dim, z_dim])               # q(z | x, y, a)
+        self.decoder = Decoder([y_dim + z_dim, list(reversed(h_dim)), x_dim])       # p(x | z, y)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_normal_(m.weight.data)
+                if m.bias is not None:
+                    m.bias.data.zero_()
 
     def classify(self, x):
-        # Auxiliary inference q(a|x)
+        # q(a | x) then q(y | x, a)
         a, a_mu, a_log_var = self.aux_encoder(x)
-
-        # Classification q(y|a,x)
         labels = self.classifier(torch.cat([x, a], dim=1))
         return labels
 
     def forward(self, x, y):
         """
-        Forward through the model
-        :param x: features
-        :param y: labels
-        :return: reconstruction
+        Forward pass computing q(a|x), q(z|x,y,a), p(a|x,y,z), p(x|z,y)
+        and accumulates KL terms.
         """
-        # Auxiliary inference q(a|x)
+        # q(a | x)
         q_a, q_a_mu, q_a_log_var = self.aux_encoder(x)
 
-        # Latent inference q(z|a,y,x)
+        # q(z | x, y, a)
         z, z_mu, z_log_var = self.encoder(torch.cat([x, y, q_a], dim=1))
 
-        # Generative p(x|z,y)
+        # p(x | z, y)
         x_mu = self.decoder(torch.cat([z, y], dim=1))
 
-        # Generative p(a|z,y,x)
+        # p(a | x, y, z)
         p_a, p_a_mu, p_a_log_var = self.aux_decoder(torch.cat([x, y, z], dim=1))
 
         a_kl = self._kld(q_a, (q_a_mu, q_a_log_var), (p_a_mu, p_a_log_var))
         z_kl = self._kld(z, (z_mu, z_log_var))
 
         self.kl_divergence = a_kl + z_kl
-
         return x_mu
 
 
 class LadderDeepGenerativeModel(DeepGenerativeModel):
     def __init__(self, dims):
         """
-        Ladder version of the Deep Generative Model.
-        Uses a hierarchical representation that is
-        trained end-to-end to give very nice disentangled
-        representations.
+        Ladder DGM: hierarchical z’s.
 
-        :param dims: dimensions of x, y, z layers and h layers
-            note that len(z) == len(h).
+        dims: [x_dim, y_dim, [z_dims_top_to_bottom], [h_dims]]
+               len(z_dims) == len(h_dims)
         """
-        [x_dim, y_dim, z_dim, h_dim] = dims
-        super(LadderDeepGenerativeModel, self).__init__([x_dim, y_dim, z_dim[0], h_dim])
+        x_dim, y_dim, z_dim, h_dim = dims
+        super().__init__([x_dim, y_dim, z_dim[0], h_dim])
 
         neurons = [x_dim, *h_dim]
+
+        # encoders bottom-up; last one takes y as well
         encoder_layers = [LadderEncoder([neurons[i - 1], neurons[i], z_dim[i - 1]]) for i in range(1, len(neurons))]
+        last = encoder_layers[-1]
+        encoder_layers[-1] = LadderEncoder([last.in_features + y_dim, last.out_features, last.z_dim])
 
-        e = encoder_layers[-1]
-        encoder_layers[-1] = LadderEncoder([e.in_features + y_dim, e.out_features, e.z_dim])
-
+        # decoders top-down (reverse order)
         decoder_layers = [LadderDecoder([z_dim[i - 1], h_dim[i - 1], z_dim[i]]) for i in range(1, len(h_dim))][::-1]
 
         self.classifier = Classifier([x_dim, h_dim[0], y_dim])
@@ -201,40 +182,39 @@ class LadderDeepGenerativeModel(DeepGenerativeModel):
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                init.xavier_normal(m.weight.data)
+                init.xavier_normal_(m.weight.data)
                 if m.bias is not None:
                     m.bias.data.zero_()
 
     def forward(self, x, y):
-        # Gather latent representation
-        # from encoders along with final z.
+        # encode ladder
         latents = []
-        for i, encoder in enumerate(self.encoder):
+        for i, enc in enumerate(self.encoder):
             if i == len(self.encoder) - 1:
-                x, (z, mu, log_var) = encoder(torch.cat([x, y], dim=1))
+                x, (z, mu, log_var) = enc(torch.cat([x, y], dim=1))
             else:
-                x, (z, mu, log_var) = encoder(x)
+                x, (z, mu, log_var) = enc(x)
             latents.append((mu, log_var))
 
         latents = list(reversed(latents))
 
-        self.kl_divergence = 0
-        for i, decoder in enumerate([-1, *self.decoder]):
-            # If at top, encoder == decoder,
-            # use prior for KL.
+        # top-level KL
+        self.kl_divergence = 0.0
+        top_mu, top_log_var = latents[0]
+        self.kl_divergence += self._kld(z, (top_mu, top_log_var))
+
+        # descend ladder with merges + KLs
+        cur_z = z
+        for i, dec in enumerate(self.decoder, start=1):
             l_mu, l_log_var = latents[i]
-            if i == 0:
-                self.kl_divergence += self._kld(z, (l_mu, l_log_var))
+            cur_z, kl_bits = dec(cur_z, l_mu, l_log_var)
+            self.kl_divergence += self._kld(*kl_bits)
 
-            # Perform downword merge of information.
-            else:
-                z, kl = decoder(z, l_mu, l_log_var)
-                self.kl_divergence += self._kld(*kl)
-
-        x_mu = self.reconstruction(torch.cat([z, y], dim=1))
+        x_mu = self.reconstruction(torch.cat([cur_z, y], dim=1))
         return x_mu
 
     def sample(self, z, y):
-        for i, decoder in enumerate(self.decoder):
-            z = decoder(z)
-        return self.reconstruction(torch.cat([z, y], dim=1))
+        cur = z
+        for dec in self.decoder:
+            cur = dec(cur)
+        return self.reconstruction(torch.cat([cur, y], dim=1))

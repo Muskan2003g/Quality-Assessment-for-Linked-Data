@@ -1,0 +1,8 @@
+# Default: store LF in repo; use OS-appropriate in working tree
+* text=auto eol=lf
+
+# Scripts
+*.py  text eol=lf
+*.sh  text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf

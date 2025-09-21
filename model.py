@@ -1,21 +1,26 @@
+# model.py — CPU/GPU agnostic, int64-safe indices
+
 import logging
 import os
-
-import numpy as np
 import math
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# (kept; some forks import this symbolically)
 from sklearn.metrics import average_precision_score
-
 from torch.utils.data import DataLoader
+
 from ote import OTE
 from dataloader import TrainDataset, TestDataset
-from helper import *
+from helper import *  # RotatE_Trans, TopKHeap, worker_init, etc.
 
 pi = 3.14159265358979323846
+
+# Single source of truth for device (used in a few places if needed)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class KGEModel(nn.Module):
@@ -27,50 +32,38 @@ class KGEModel(nn.Module):
         self.nentity = nentity
         self.nrelation = nrelation
         self.hidden_dim = hidden_dim
-        self.epsilon = 2.0  # for embedding initialization
+        self.epsilon = 2.0
         self.scale_relation = True
 
-        self.gamma = nn.Parameter(  # for embedding initialization and modeling (RotatE, TransE)
-            torch.Tensor([gamma]),
-            requires_grad=False
-        )
+        # used both for init and scoring in TransE/RotatE
+        self.gamma = nn.Parameter(torch.tensor([gamma], dtype=torch.float32), requires_grad=False)
 
         self.test_split_num = 1
 
-        # (15 + 2) / 200 ~ 0.08
-        # (9 + 2 ) / 1000 ~ 0.01
-        self.embedding_range = nn.Parameter(
-            torch.Tensor([0.01]),
-            requires_grad=False
-        )
+        # (9+2)/1000 ~ 0.011, safe small init range
+        self.embedding_range = nn.Parameter(torch.tensor([0.01], dtype=torch.float32), requires_grad=False)
         self._aux = {}
 
         self.entity_dim = hidden_dim * 2 if double_entity_embedding else hidden_dim
         self.relation_dim = hidden_dim * 2 if double_relation_embedding else hidden_dim
         self.ote = None
+
         if model_name == 'OTE':
             assert self.entity_dim % args.ote_size == 0
-            sub_emb_num = self.entity_dim // args.ote_size
             self.ote = OTE(args.ote_size, args.ote_scale)
             use_scale = self.ote.use_scale
             self.relation_dim = self.entity_dim * (args.ote_size + (1 if use_scale else 0))
 
             self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))
-            nn.init.uniform_(
-                tensor=self.relation_embedding,
-                a=0,
-                b=1.0
-            )
+            nn.init.uniform_(self.relation_embedding, a=0.0, b=1.0)
             if use_scale:
-                self.relation_embedding.data.view(-1, args.ote_size + 1)[:,
-                -1] = self.ote.scale_init()  # start with no scale
-            # make initial relation embedding orthogonal
+                self.relation_embedding.data.view(-1, args.ote_size + 1)[:, -1] = self.ote.scale_init()
             rel_emb_data = self.orth_rel_embedding()
             self.relation_embedding.data.copy_(rel_emb_data.view(nrelation, self.relation_dim))
         else:
             self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))
             nn.init.uniform_(
-                tensor=self.relation_embedding,
+                self.relation_embedding,
                 a=-self.embedding_range.item(),
                 b=self.embedding_range.item()
             )
@@ -78,11 +71,10 @@ class KGEModel(nn.Module):
         if init_embedding:
             self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim))
             nn.init.uniform_(
-                tensor=self.entity_embedding,
+                self.entity_embedding,
                 a=-self.embedding_range.item(),
                 b=self.embedding_range.item()
             )
-
         else:
             self.entity_embedding = None
 
@@ -91,7 +83,8 @@ class KGEModel(nn.Module):
 
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else lambda x: x
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else (lambda x: x)
 
     def orth_rel_embedding(self):
         rel_emb_size = self.relation_embedding.size()
@@ -101,7 +94,8 @@ class KGEModel(nn.Module):
         rel_embedding = self.ote.orth_embedding(rel_embedding).view(rel_emb_size)
         if rel_embedding is None:
             rel_embedding = self.ote.fix_embedding_rank(
-                self.relation_embedding.view(-1, ote_size, ote_size + scale_dim))
+                self.relation_embedding.view(-1, ote_size, ote_size + scale_dim)
+            )
             if self.training:
                 self.relation_embedding.data.copy_(rel_embedding.view(rel_emb_size))
                 rel_embedding = self.relation_embedding.view(-1, ote_size, ote_size + scale_dim)
@@ -120,100 +114,68 @@ class KGEModel(nn.Module):
         return self.relation_embedding, self.entity_embedding
 
     def reset_embedding(self):
-        for k in [key for key in self._aux.keys() if key != "static"]:
-            self._aux[k] = None
-        pass
+        # clear cached aux embeddings except any marked "static"
+        for k in list(self._aux.keys()):
+            if k != "static":
+                self._aux[k] = None
 
     def get_model_func(self):
-        model_func = {
+        return {
             'TransE': self.TransE,
             'DistMult': self.DistMult,
             'ComplEx': self.ComplEx,
             'RotatE': self.RotatE,
             'OTE': self.OTE,
         }
-        return model_func
 
     def forward(self, sample, mode='single'):
         """
-        Forward function that calculate the score of a batch of triples.
-        In the 'single' mode, sample is a batch of triple.
-        In the 'head-batch' or 'tail-batch' mode, sample consists two part.
-        The first part is usually the positive sample.
-        And the second part is the entities in the negative samples.
-        Because negative samples and positive samples usually share two elements
-        in their triple ((head, relation) or (relation, tail)).
+        Calculate the score of a batch of triples.
+        Ensures all index tensors are int64 (LongTensor) on the embeddings’ device.
         """
-
         relation_embedding, entity_embedding = self.get_embedding()
+        emb_device = relation_embedding.device  # keep everything on same device as embeddings
+
         if mode in ('single', 'head-single', 'tail-single'):
-            batch_size, negative_sample_size = sample.size(0), 1
+            # sample: [B, 3]
+            idx_h = sample[:, 0].to(emb_device).long()
+            idx_r = sample[:, 1].to(emb_device).long()
+            idx_t = sample[:, 2].to(emb_device).long()
 
-            head = torch.index_select(
-                entity_embedding,
-                dim=0,
-                index=sample[:, 0]
-            ).unsqueeze(1)
+            head = torch.index_select(entity_embedding, 0, idx_h).unsqueeze(1)
+            relation = torch.index_select(relation_embedding, 0, idx_r).unsqueeze(1)
+            tail = torch.index_select(entity_embedding, 0, idx_t).unsqueeze(1)
 
-            relation = torch.index_select(
-                relation_embedding,
-                dim=0,
-                index=sample[:, 1]
-            ).unsqueeze(1)
-
-            tail = torch.index_select(
-                entity_embedding,
-                dim=0,
-                index=sample[:, 2]
-            ).unsqueeze(1)
             head_ids = sample[:, 0].unsqueeze(1) if mode == 'head-single' else sample[:, 0]
             tail_ids = sample[:, 2].unsqueeze(1) if mode == 'tail-single' else sample[:, 2]
             self._aux['samples'] = (head_ids, sample[:, 1], tail_ids, mode)
 
         elif mode == 'head-batch':
+            # sample: (tail_part[B,3], head_part[B, Nneg])
             tail_part, head_part = sample
             batch_size, negative_sample_size = head_part.size(0), head_part.size(1)
 
-            head = torch.index_select(
-                entity_embedding,
-                dim=0,
-                index=head_part.view(-1)
-            ).view(batch_size, negative_sample_size, -1)
+            idx_head = head_part.view(-1).to(emb_device).long()
+            idx_rel = tail_part[:, 1].to(emb_device).long()
+            idx_tail = tail_part[:, 2].to(emb_device).long()
 
-            relation = torch.index_select(
-                relation_embedding,
-                dim=0,
-                index=tail_part[:, 1]
-            ).unsqueeze(1)
-
-            tail = torch.index_select(
-                entity_embedding,
-                dim=0,
-                index=tail_part[:, 2]
-            ).unsqueeze(1)
+            head = torch.index_select(entity_embedding, 0, idx_head).view(batch_size, negative_sample_size, -1)
+            relation = torch.index_select(relation_embedding, 0, idx_rel).unsqueeze(1)
+            tail = torch.index_select(entity_embedding, 0, idx_tail).unsqueeze(1)
             self._aux['samples'] = (head_part, tail_part[:, 1], tail_part[:, 2], mode)
 
         elif mode == 'tail-batch':
+            # sample: (head_part[B,3], tail_part[B, Nneg])
             head_part, tail_part = sample
             batch_size, negative_sample_size = tail_part.size(0), tail_part.size(1)
 
-            head = torch.index_select(
-                entity_embedding,
-                dim=0,
-                index=head_part[:, 0]
-            ).unsqueeze(1)
+            idx_h = head_part[:, 0].to(emb_device).long()
+            idx_r = head_part[:, 1].to(emb_device).long()
+            idx_t = tail_part.view(-1).to(emb_device).long()
 
-            relation = torch.index_select(
-                relation_embedding,
-                dim=0,
-                index=head_part[:, 1]
-            ).unsqueeze(1)
-
-            tail = torch.index_select(
-                entity_embedding,
-                dim=0,
-                index=tail_part.view(-1)
-            ).view(batch_size, negative_sample_size, -1)
+            head = torch.index_select(entity_embedding, 0, idx_h).unsqueeze(1)
+            relation = torch.index_select(relation_embedding, 0, idx_r).unsqueeze(1)
+            tail = torch.index_select(entity_embedding, 0, idx_t).view(batch_size, negative_sample_size, -1)
             self._aux['samples'] = (head_part[:, 0], head_part[:, 1], tail_part, mode)
 
         else:
@@ -227,32 +189,23 @@ class KGEModel(nn.Module):
 
         return score
 
-    def TransE(self, head, relation, tail, mode, topk=False):
-        if mode == 'head-batch':
-            score = head + (relation - tail)
-        else:
-            score = (head + relation) - tail
+    # ----- Scoring functions -----
 
+    def TransE(self, head, relation, tail, mode, topk=False):
+        score = head + (relation - tail) if mode == 'head-batch' else (head + relation) - tail
         if topk:
             return score
-
         if mode == 'detect':
-            score = - torch.norm(score, p=1, dim=1)
+            score = -torch.norm(score, p=1, dim=1)
         else:
             score = self.gamma.item() - torch.norm(score, p=1, dim=2)
         return score
 
     def DistMult(self, head, relation, tail, mode, topk=False):
-        if mode == 'head-batch':
-            score = head * (relation * tail)
-        else:
-            score = (head * relation) * tail
-
+        score = head * (relation * tail) if mode == 'head-batch' else (head * relation) * tail
         if topk:
             return score
-
-        score = score.sum(dim=2)
-        return score
+        return score.sum(dim=2)
 
     def ComplEx(self, head, relation, tail, mode, topk=False):
         re_head, im_head = torch.chunk(head, 2, dim=2)
@@ -270,18 +223,13 @@ class KGEModel(nn.Module):
 
         if topk:
             return score
-
-        score = score.sum(dim=2)
-        return score
+        return score.sum(dim=2)
 
     def RotatE(self, head, relation, tail, mode, topk=False):
-
         re_head, im_head = torch.chunk(head, 2, dim=-1)
         re_tail, im_tail = torch.chunk(tail, 2, dim=-1)
 
-        # Make phases of relations uniformly distributed in [-pi, pi]
         phase_relation = relation / (self.embedding_range.item() / pi) if self.scale_relation else relation
-
         re_relation = torch.cos(phase_relation)
         im_relation = torch.sin(phase_relation)
 
@@ -294,14 +242,12 @@ class KGEModel(nn.Module):
             re_score = re_score - re_tail
             im_score = im_score - im_tail
 
-        score = torch.stack([re_score, im_score], dim=0)
-        score = score.norm(dim=0)
+        score = torch.stack([re_score, im_score], dim=0).norm(dim=0)
 
         if topk:
             return score
 
-        score = self.gamma.item() - score.sum(dim=-1)
-        return score
+        return self.gamma.item() - score.sum(dim=-1)
 
     def OTE(self, head, relation, tail, mode, topk=False):
         if mode in ("head-batch", 'head-single'):
@@ -315,75 +261,79 @@ class KGEModel(nn.Module):
             if topk:
                 return output - tail
             score = self.ote.score(output - tail)
-        score = self.gamma.item() - score
+        return self.gamma.item() - score
 
-        return score
+    # ----- Training / evaluation helpers -----
 
     @staticmethod
     def apply_loss_func(score, loss_func, is_negative_score=False, label_smoothing=0.1):
         if isinstance(loss_func, nn.SoftMarginLoss):
-            tgt = -1 if is_negative_score else 1
-            tgt = torch.empty(score.size()).fill_(tgt).to(score.device)
-            output = loss_func(score, tgt)
+            tgt_val = -1 if is_negative_score else 1
+            tgt = torch.empty_like(score).fill_(tgt_val)
+            return loss_func(score, tgt)
         elif isinstance(loss_func, nn.BCELoss):
-            # bceloss
-            tgt = 0 if is_negative_score else 1
+            tgt_val = 0 if is_negative_score else 1
             if label_smoothing > 0:
-                tgt = tgt * (1 - label_smoothing) + 0.0001
-            tgt = torch.empty(score.size()).fill_(tgt).to(score.device)
-            output = loss_func(score, tgt)
+                tgt_val = tgt_val * (1 - label_smoothing) + 0.0001
+            tgt = torch.empty_like(score).fill_(tgt_val)
+            return loss_func(score, tgt)
         else:
-            output = loss_func(-score) if is_negative_score else loss_func(score)
-        return output
+            return loss_func(-score) if is_negative_score else loss_func(score)
 
     @staticmethod
     def train_step(model, train_iterator, confidence, loss_func, args, generator=None):
         """
-        A single train step. Apply back-propation and return the loss.
+        One optimization step on a minibatch.
         """
         model.train()
 
         positive_sample, negative_sample, subsampling_weight, mode, idxs = next(train_iterator)
-        batch_confidence = torch.index_select(confidence, 0, torch.LongTensor(idxs).cuda())
-        model.cal_embedding()
 
-        positive_sample = positive_sample.cuda()
+        # Keep everything on the same device as model params
+        model_device = next(model.parameters()).device
+        confidence_device = confidence.device if isinstance(confidence, torch.Tensor) else model_device
+
+        idx_tensor = torch.as_tensor(idxs, dtype=torch.long, device=confidence_device)
+        batch_confidence = torch.index_select(confidence, 0, idx_tensor)
+
+        positive_sample = positive_sample.to(model_device)
         if isinstance(negative_sample, tuple):
-            negative_sample = [x.cuda() for x in negative_sample]
+            negative_sample = [x.to(model_device) for x in negative_sample]
         else:
-            negative_sample = negative_sample.cuda()
-        # subsampling_weight = subsampling_weight.cuda()
-        batch_confidence = batch_confidence.cuda()
+            negative_sample = negative_sample.to(model_device)
+        # subsampling_weight is unused in this loss variant
 
         if generator is not None:
-            positive_sample, negative_sample = generator.generate(model, positive_sample, negative_sample, mode,
-                                                                  train=False, n_sample=args.negative_sample_size // 2)
+            positive_sample, negative_sample = generator.generate(
+                model, positive_sample, negative_sample, mode,
+                train=False, n_sample=args.negative_sample_size // 2
+            )
 
         negative_score = model((positive_sample, negative_sample), mode=mode)
 
         if args.negative_adversarial_sampling:
-            # In self-adversarial sampling, we do not apply back-propagation on the sampling weight
-            negative_score = (F.softmax(negative_score * args.adversarial_temperature, dim=1).detach()
-                              * model.apply_loss_func(negative_score, loss_func, True, args.label_smoothing)).sum(dim=1)
+            negative_score = (
+                F.softmax(negative_score * args.adversarial_temperature, dim=1).detach()
+                * model.apply_loss_func(negative_score, loss_func, True, args.label_smoothing)
+            ).sum(dim=1)
         else:
             negative_score = model.apply_loss_func(negative_score, loss_func, True, args.label_smoothing).mean(dim=1)
+
         pmode = "head-single" if mode == "head-batch" else "tail-single"
         positive_score = model(positive_sample, pmode)
-
         positive_score = model.apply_loss_func(positive_score, loss_func, False, args.label_smoothing).squeeze(dim=1)
-        loss_sign = -1
 
-        positive_sample_loss = loss_sign * (batch_confidence * positive_score).sum() / batch_confidence.sum()
-        negative_sample_loss = loss_sign * (batch_confidence * negative_score).sum() / batch_confidence.sum()
+        loss_sign = -1.0
+        denom = batch_confidence.sum().clamp_min(1e-6)  # avoid div-by-zero
+        positive_sample_loss = loss_sign * (batch_confidence * positive_score).sum() / denom
+        negative_sample_loss = loss_sign * (batch_confidence * negative_score).sum() / denom
+        loss = 0.5 * (positive_sample_loss + negative_sample_loss)
 
-        loss = (positive_sample_loss + negative_sample_loss) / 2
-
+        # ---- FIXED L3 regularization ----
         if args.regularization != 0.0:
-            # Use L3 regularization for ComplEx and DistMult
-            regularization = args.regularization * (
-                    model.entity_embedding.norm(p=3) ** 3 +
-                    model.relation_embedding.norm(p=3).norm(p=3) ** 3
-            )
+            reg_ent = model.entity_embedding.norm(p=3) ** 3
+            reg_rel = model.relation_embedding.norm(p=3) ** 3
+            regularization = args.regularization * (reg_ent + reg_rel)
             loss = loss + regularization
             regularization_log = {'regularization': regularization.item()}
         else:
@@ -398,7 +348,6 @@ class KGEModel(nn.Module):
             'loss': loss.item()
         }
         model.reset_embedding()
-
         return log
 
     def split_test(self, sample, mode):
@@ -414,40 +363,24 @@ class KGEModel(nn.Module):
     @staticmethod
     def test_step(model, test_triples, all_true_triples, args, head_only=False, tail_only=False):
         """
-        Evaluate the model on test dataset.
+        Evaluate on test set.
         """
-
         model.eval()
         model.cal_embedding()
+        model_device = next(model.parameters()).device
 
-        # Otherwise use standard (filtered) MRR, MR, HITS@1, HITS@3, and HITS@10 metrics
-        # Prepare dataloader for evaluation
+        # OS-safe dataloaders (0 on Windows to avoid hang; 4 elsewhere)
+        num_workers = 0 if os.name == "nt" else 4
+
         test_dataloader_head = DataLoader(
-            TestDataset(
-                test_triples,
-                all_true_triples,
-                args.nentity,
-                args.nrelation,
-                'head-batch'
-            ),
-            batch_size=args.test_batch_size,
-            num_workers=4,
-            worker_init_fn=worker_init,
-            collate_fn=TestDataset.collate_fn
+            TestDataset(test_triples, all_true_triples, args.nentity, args.nrelation, 'head-batch'),
+            batch_size=args.test_batch_size, num_workers=num_workers,
+            worker_init_fn=worker_init, collate_fn=TestDataset.collate_fn
         )
-
         test_dataloader_tail = DataLoader(
-            TestDataset(
-                test_triples,
-                all_true_triples,
-                args.nentity,
-                args.nrelation,
-                'tail-batch'
-            ),
-            batch_size=args.test_batch_size,
-            num_workers=4,
-            worker_init_fn=worker_init,
-            collate_fn=TestDataset.collate_fn
+            TestDataset(test_triples, all_true_triples, args.nentity, args.nrelation, 'tail-batch'),
+            batch_size=args.test_batch_size, num_workers=num_workers,
+            worker_init_fn=worker_init, collate_fn=TestDataset.collate_fn
         )
         if head_only:
             test_dataset_list = [test_dataloader_head]
@@ -456,7 +389,7 @@ class KGEModel(nn.Module):
         else:
             test_dataset_list = [test_dataloader_head, test_dataloader_tail]
 
-        logs = [[] for i in test_dataset_list]
+        logs = [[] for _ in test_dataset_list]
 
         step = 0
         total_steps = sum([len(dataset) for dataset in test_dataset_list])
@@ -464,17 +397,16 @@ class KGEModel(nn.Module):
         with torch.no_grad():
             for k, test_dataset in enumerate(test_dataset_list):
                 for positive_sample, negative_sample, filter_bias, mode in test_dataset:
-                    positive_sample = positive_sample.cuda()
-                    negative_sample = negative_sample.cuda()
-                    filter_bias = filter_bias.cuda()
+                    positive_sample = positive_sample.to(model_device)
+                    negative_sample = negative_sample.to(model_device)
+                    filter_bias = filter_bias.to(model_device)
 
                     batch_size = positive_sample.size(0)
 
                     score = model.split_test((positive_sample, negative_sample), mode)
-
                     score += filter_bias * (score.max() - score.min())
 
-                    # Explicitly sort all the entities to ensure that there is no test exposure bias
+                    # Explicit sort to avoid exposure bias
                     argsort = torch.argsort(score, dim=1, descending=True)
 
                     if mode == 'head-batch':
@@ -485,11 +417,8 @@ class KGEModel(nn.Module):
                         raise ValueError('mode %s not supported' % mode)
 
                     for i in range(batch_size):
-                        # Notice that argsort is not ranking
                         ranking = torch.nonzero(argsort[i, :] == positive_arg[i])
                         assert ranking.size(0) == 1
-
-                        # ranking + 1 is the true ranking used in evaluation metrics
                         ranking = 1 + ranking.item()
                         logs[k].append({
                             'MRR': 1.0 / ranking,
@@ -498,9 +427,7 @@ class KGEModel(nn.Module):
                             'HITS@3': 1.0 if ranking <= 3 else 0.0,
                             'HITS@10': 1.0 if ranking <= 10 else 0.0,
                         })
-                        buf = "%s " % mode + "rank %d " % ranking + " ".join(("%s" % int(x) for x in
-                                                                              positive_sample[
-                                                                                  i])) + "\t"  # '[ %d %d %d ]\t'%(int(x) for x in positive_sample[i])
+                        buf = "%s rank %d " % (mode, ranking) + " ".join(("%s" % int(x) for x in positive_sample[i])) + "\t"
                         buf = buf + " ".join(["%d" % x for x in argsort[i][:10]])
                         logging.debug(buf)
 
@@ -509,17 +436,17 @@ class KGEModel(nn.Module):
 
                     step += 1
 
-            metrics = [{} for l in logs]
+            metrics = [{} for _ in logs]
             for i, log in enumerate(logs):
                 for metric in log[0].keys():
-                    metrics[i][metric] = sum([lg[metric] for lg in log]) / len(log)
+                    metrics[i][metric] = sum([lg[metric] for lg in log]) / max(1, len(log))
                 if len(logs) > 1:
                     metrics[i]['name'] = "head-batch" if i == 0 else "tail-batch"
             if len(logs) == 2:
                 metrics_all = {}
                 log_all = logs[0] + logs[1]
                 for metric in log_all[0].keys():
-                    metrics_all[metric] = sum([lg[metric] for lg in log_all]) / len(log_all)
+                    metrics_all[metric] = sum([lg[metric] for lg in log_all]) / max(1, len(log_all))
                 metrics_all['name'] = "Overall"
                 metrics.append(metrics_all)
 
@@ -529,19 +456,20 @@ class KGEModel(nn.Module):
     @staticmethod
     def find_topk_triples_ssvae(model, train_iterator, labelled_iterator, unlabelled_iterator, noise_triples, rate=10):
         """
-        Find topk triples.
+        Find top-k triples by model score.
         """
         model.eval()
         noise_triples = set(noise_triples)
-        k = len(train_iterator.dataloader_head.dataset.triples) * rate // 100
+        k = max(1, len(train_iterator.dataloader_head.dataset.triples) * rate // 100)
         topk_heap = TopKHeap(k)
         all_triples = train_iterator.dataloader_head.dataset.triples
         model_func = model.get_model_func()
         relation_embedding, entity_embedding = model.get_embedding()
+        emb_device = entity_embedding.device
         i = 0
         while i < len(all_triples):
             j = min(i + 1024, len(all_triples))
-            sample = torch.LongTensor(all_triples[i: j]).cuda()
+            sample = torch.tensor(all_triples[i: j], dtype=torch.long, device=emb_device)
             h = torch.index_select(entity_embedding, 0, sample[:, 0]).detach()
             r = torch.index_select(relation_embedding, 0, sample[:, 1]).detach()
             t = torch.index_select(entity_embedding, 0, sample[:, 2]).detach()
@@ -552,9 +480,10 @@ class KGEModel(nn.Module):
             i = j
 
         topk_list = topk_heap.topk()
-        _, topk_triples = list(zip(*topk_list))
+        topk_triples = [t for _, t in topk_list] if len(topk_list) > 0 else []
+
         labelled_iterator.dataloader_head.dataset.triples = topk_triples
-        labelled_iterator.dataloader_tail.dataset.triples = [tri for tri in labelled_iterator.dataloader_head.dataset.triples]
+        labelled_iterator.dataloader_tail.dataset.triples = list(labelled_iterator.dataloader_head.dataset.triples)
         labelled_iterator.dataloader_head.dataset.len = len(topk_triples)
         labelled_iterator.dataloader_tail.dataset.len = len(topk_triples)
 
@@ -563,43 +492,37 @@ class KGEModel(nn.Module):
 
         unlabelled_triples = list(set(all_triples) - set(topk_triples))
         unlabelled_iterator.dataloader_head.dataset.triples = unlabelled_triples
-        unlabelled_iterator.dataloader_tail.dataset.triples = [tri for tri in unlabelled_iterator.dataloader_head.dataset.triples]
+        unlabelled_iterator.dataloader_tail.dataset.triples = list(unlabelled_iterator.dataloader_head.dataset.triples)
         unlabelled_iterator.dataloader_head.dataset.len = len(unlabelled_triples)
         unlabelled_iterator.dataloader_tail.dataset.len = len(unlabelled_triples)
 
     @staticmethod
     def error_detect(kge_model, model, test_triples, true_num, use_sigmoid=False):
         """
-        Detect error.
+        Detect error triples using the classifier output on KGE scores.
         """
         kge_model.eval()
         model.eval()
         kge_model_func = kge_model.get_model_func()
         relation_embedding, entity_embedding = kge_model.get_embedding()
+        emb_device = entity_embedding.device
         scores = []
         i = 0
         while i < len(test_triples):
             j = min(i + 1024, len(test_triples))
-            sample = torch.LongTensor(test_triples[i: j]).cuda()
+            sample = torch.tensor(test_triples[i: j], dtype=torch.long, device=emb_device)
             h = torch.index_select(entity_embedding, 0, sample[:, 0]).detach()
             r = torch.index_select(relation_embedding, 0, sample[:, 1]).detach()
             t = torch.index_select(entity_embedding, 0, sample[:, 2]).detach()
             s = kge_model_func[kge_model.model_name](h, r, t, 'single', True).detach()
             s = s.view(sample.size(0), -1)
-            c = model.classify(s)
-            c = c.detach().view(-1)
-            for score in c:
-                scores.append(score.item())
+            c = model.classify(s).detach().view(-1)
+            scores.extend([float(x) for x in c])
             i = j
 
         error_triples = []
         for threshold in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-
-            TP = 0
-            FN = 0
-            FP = 0
-            TN = 0
-
+            TP = FN = FP = TN = 0
             for index, score in enumerate(scores):
                 if index < true_num:
                     if score >= threshold:
@@ -616,67 +539,39 @@ class KGEModel(nn.Module):
                     else:
                         FP += 1
 
-            TN_acc = TN / (TN + FP)
-            log = {
+            TN_acc = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+            logging.info({
                 'threshold': threshold,
-                'TP': TP,
-                'FN': FN,
-                'FP': FP,
-                'TN': TN,
+                'TP': TP, 'FN': FN, 'FP': FP, 'TN': TN,
                 'TN-acc': TN_acc
-            }
-            logging.info(log)
+            })
 
         return error_triples
 
     @staticmethod
     def update_confidence(kge_model, model, train_iterator, confidence, soft, true_num, args):
         """
-        Update confidence of all train triples.
+        Update confidence for all train triples using the SSVAE classifier.
         """
         kge_model.eval()
         model.eval()
         all_triples = train_iterator.dataloader_head.dataset.triples
         kge_model_func = kge_model.get_model_func()
         relation_embedding, entity_embedding = kge_model.get_embedding()
+        emb_device = entity_embedding.device
         threshold = args.threshold
         i = 0
         while i < len(all_triples):
             j = min(i + 1024, len(all_triples))
-            sample = torch.LongTensor(all_triples[i: j]).cuda()
+            sample = torch.tensor(all_triples[i: j], dtype=torch.long, device=emb_device)
             h = torch.index_select(entity_embedding, 0, sample[:, 0]).detach()
             r = torch.index_select(relation_embedding, 0, sample[:, 1]).detach()
             t = torch.index_select(entity_embedding, 0, sample[:, 2]).detach()
             s = kge_model_func[kge_model.model_name](h, r, t, 'single', True).detach()
             s = s.view(sample.size(0), -1)
-            c = model.classify(s)
-            c = c.detach().view(-1)
+            c = model.classify(s).detach().view(-1)
             if soft:
-                confidence[i: j] = c
+                confidence[i: j] = c.to(confidence.device)
             else:
-                confidence[i: j] = (c >= threshold).type(torch.float32) + 0.00001
+                confidence[i: j] = (c >= threshold).type(torch.float32).to(confidence.device) + 1e-5
             i = j
-
-        # TP = (confidence[0: true_num] >= threshold).cpu().sum().item()
-        # FN = (confidence[0: true_num] < threshold).cpu().sum().item()
-        # FP = (confidence[true_num:] >= threshold).cpu().sum().item()
-        # TN = (confidence[true_num:] < threshold).cpu().sum().item()
-        # precision = TP / (TP + FP)
-        # recall = TP / (TP + FN)
-        # F1 = 2 * precision * recall / (precision + recall)
-        # acc = (TP + TN) / (TP + TN + FP + FN)
-        #
-        # log = {
-        #     'threshold': threshold,
-        #     'mean_pos_score': torch.mean(confidence[0: true_num]).item(),
-        #     'mean_neg_score': torch.mean(confidence[true_num:]).item(),
-        #     'TP': TP,
-        #     'FN': FN,
-        #     'FP': FP,
-        #     'TN': TN,
-        #     'precision': precision,
-        #     'recall': recall,
-        #     'F1': F1,
-        #     'accuracy': acc
-        # }
-        # logging.info(log)
