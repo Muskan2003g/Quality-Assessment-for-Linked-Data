@@ -18,3 +18,5 @@ ui_runs/
 
 # Datasets (keep scripts instead)
 dataset/
+
+app1.py
